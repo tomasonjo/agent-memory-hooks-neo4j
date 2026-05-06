@@ -1,7 +1,8 @@
-# Agent Memory Hooks (Claude Code + Codex)
+# Agent Memory Hooks (Claude Code + Codex + Cursor)
 
-A two-stage memory system for [Claude Code](https://claude.com/claude-code)
-and [Codex](https://developers.openai.com/codex/hooks), backed by Neo4j.
+A two-stage memory system for [Claude Code](https://claude.com/claude-code),
+[Codex](https://developers.openai.com/codex/hooks), and
+[Cursor](https://www.cursor.com/), backed by Neo4j.
 
 1. **Hooks (online)** — capture every session event from either agent into a
    shared graph as it happens.
@@ -10,8 +11,8 @@ and [Codex](https://developers.openai.com/codex/hooks), backed by Neo4j.
 
 The hooks record *what happened*. The dream phase decides *what's worth
 remembering*. Both clients write into the same Neo4j instance; nodes are
-tagged with `client: "claude_code" | "codex"` so you can query across or
-within agents.
+tagged with `client: "claude_code" | "codex" | "cursor"` so you can query
+across or within agents.
 
 ## Repo layout
 
@@ -29,6 +30,12 @@ hooks/
   hooks/
     log_event.sh           # → hooks/log_event.py --client codex
     inject_memory.sh       # → hooks/inject_memory.py --client codex
+.cursor/
+  hooks.json               # modern Cursor hook registration
+  settings.json            # legacy/compat Cursor hook registration
+  hooks/
+    log_event.sh           # → hooks/log_event.py --client cursor
+    inject_memory.sh       # → hooks/inject_memory.py --client cursor
 dream/
   dream.py                 # offline consolidation script
   README.md                # dream-phase docs
@@ -39,7 +46,7 @@ test_hooks.py              # smoke test for the hook writer
 
 ## Stage 1 — Hooks
 
-Each session (Claude Code or Codex) becomes a linked list of events:
+Each session (Claude Code, Codex, or Cursor) becomes a linked list of events:
 
 ```
 (Session {session_id, client}) -[:FIRST_EVENT]->  (Event) -[:NEXT]-> (Event) -> ...
@@ -66,6 +73,12 @@ The hooks are already wired up:
 - **Claude Code**: `.claude/settings.json` — run Claude Code from this dir.
 - **Codex**: `.codex/hooks.json` — run Codex from this dir with
   `[features] codex_hooks = true` enabled in `~/.codex/config.toml`.
+- **Cursor**: `.cursor/hooks.json` (preferred) or `.cursor/settings.json`
+  (legacy compatibility) — open this dir in Cursor.
+
+For Python dependencies, Cursor wrappers prefer `./.venv/bin/python` and
+fallback to `python3`. This avoids interpreter mismatches when Cursor runs in
+a different environment than your shell.
 
 Both clients stream events into the same Neo4j instance; Session/Event nodes
 are tagged with the originating `client`.

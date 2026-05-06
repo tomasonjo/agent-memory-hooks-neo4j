@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "command": ".cursor/hooks/log_event.sh"
+      },
+      {
+        "command": ".cursor/hooks/inject_memory.sh"
+      }
+    ],
+    "preToolUse": [
+      {
+        "command": ".cursor/hooks/log_event.sh"
+      }
+    ],
+    "postToolUse": [
+      {
+        "command": ".cursor/hooks/log_event.sh"
+      }
+    ],
+    "stop": [
+      {
+        "command": ".cursor/hooks/log_event.sh"
+      }
+    ],
+    "beforeSubmitPrompt": [
+      {
+        "command": ".cursor/hooks/log_event.sh"
+      },
+      {
+        "command": ".cursor/hooks/inject_memory.sh"
+      }
+    ]
+  }
+}

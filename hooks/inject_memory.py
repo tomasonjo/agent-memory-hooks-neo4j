@@ -114,17 +114,18 @@ def emit(event_name: str, context: str):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--client", required=True, choices=["claude_code", "codex"])
+    parser.add_argument("--client", required=True, choices=["claude_code", "codex", "cursor"])
     parser.parse_args()
 
     try:
         raw = sys.stdin.read()
         data = json.loads(raw) if raw.strip() else {}
         event = data.get("hook_event_name")
-        if event == "SessionStart":
-            emit(event, session_start_context())
-        elif event == "UserPromptSubmit":
-            emit(event, prompt_context(data.get("prompt", "")))
+        normalized = (event or "").lower()
+        if normalized in {"sessionstart", "session_start"}:
+            emit(event or "sessionStart", session_start_context())
+        elif normalized in {"userpromptsubmit", "beforesubmitprompt"}:
+            emit(event or "beforeSubmitPrompt", prompt_context(data.get("prompt", "")))
     except Exception as e:
         print(f"inject_memory error: {e}", file=sys.stderr)
 

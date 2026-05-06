@@ -1,6 +1,6 @@
-# Agent Memory Hooks (Claude Code + Codex)
+# Agent Memory Hooks (Claude Code + Codex + Cursor)
 
-Hooks for Claude Code and Codex that store session events as a linked list in Neo4j.
+Hooks for Claude Code, Codex, and Cursor that store session events as a linked list in Neo4j.
 
 ## Setup
 
@@ -30,6 +30,7 @@ Codex additionally fires PermissionRequest (not currently registered).
 `hooks/log_event.py` and `hooks/inject_memory.py` are shared. Per-client glue:
 - `.claude/settings.json` → `.claude/hooks/*.sh` → `hooks/*.py --client claude_code`
 - `.codex/hooks.json` → `.codex/hooks/*.sh` → `hooks/*.py --client codex`
+- `.cursor/settings.json` → `.cursor/hooks/*.sh` → `hooks/*.py --client cursor`
 
 ## Testing
 
