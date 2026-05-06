@@ -2,13 +2,16 @@
 """
 Shared hook: inject :Memory nodes into the session as additional context.
 
-- SessionStart: load every `profile/*` memory in full + a TOC of remaining paths
-  so the model knows what else is available.
-- UserPromptSubmit: rough keyword match between the prompt and memory bodies/paths;
-  inject the top hits inline.
+- SessionStart: load up to 5 profile/* memories so the model has user context.
+- UserPromptSubmit: fulltext search against memory content/path with an OR-term
+  fallback when the initial query returns nothing.
 
 Used by both Claude Code and Codex. Both clients accept the same output shape:
   {"hookSpecificOutput": {"hookEventName": "...", "additionalContext": "..."}}
+
+Requires a fulltext index (create once):
+  CREATE FULLTEXT INDEX memory_fulltext IF NOT EXISTS
+  FOR (m:Memory) ON EACH [m.content, m.path]
 """
 
 import argparse
@@ -24,7 +27,7 @@ NEO4J_USER = os.environ.get("HOOKS_NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.environ.get("HOOKS_NEO4J_PASSWORD", "password")
 
 MAX_PROMPT_HITS = 5
-MIN_KEYWORD_LEN = 4
+MIN_FULLTEXT_SCORE = 0.5
 
 STOPWORDS = {
     "this", "that", "with", "from", "have", "what", "when", "where", "which",
@@ -39,58 +42,53 @@ def get_driver():
     return GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
 
 
+def _fulltext_search(session, query: str, limit: int = MAX_PROMPT_HITS) -> list:
+    cypher = """
+    CALL db.index.fulltext.queryNodes('memory_fulltext', $query)
+    YIELD node, score
+    WHERE score > $min_score
+    RETURN node.path AS path, node.content AS content, score
+    ORDER BY score DESC
+    LIMIT $limit
+    """
+    return list(session.run(cypher, query=query, min_score=MIN_FULLTEXT_SCORE, limit=limit))
+
+
+def _extract_terms(prompt: str) -> list[str]:
+    words = re.findall(r"[a-zA-Z][a-zA-Z0-9_-]+", prompt.lower())
+    return [w for w in words if len(w) >= 3 and w not in STOPWORDS]
+
+
 def session_start_context() -> str:
     with get_driver() as driver, driver.session() as s:
         profile = list(s.run(
             "MATCH (m:Memory) WHERE m.path STARTS WITH 'profile/' "
-            "RETURN m.path AS path, m.content AS content ORDER BY m.path"
-        ))
-        other = list(s.run(
-            "MATCH (m:Memory) WHERE NOT m.path STARTS WITH 'profile/' "
-            "RETURN m.path AS path ORDER BY m.path"
+            "RETURN m.path AS path, m.content AS content ORDER BY m.path "
+            "LIMIT 5"
         ))
 
-    if not profile and not other:
+    if not profile:
         return ""
 
-    parts = ["# Memory (from prior sessions)\n"]
-    if profile:
-        parts.append("## Profile\n")
-        for r in profile:
-            parts.append(f"### {r['path']}\n{r['content']}\n")
-    if other:
-        parts.append("## Other available memories\n")
-        parts.append("Other memory paths exist but were not auto-loaded. "
-                     "Recall as needed:\n")
-        for r in other:
-            parts.append(f"- `{r['path']}`")
+    parts = ["# Memory (from prior sessions)\n", "## Profile\n"]
+    for r in profile:
+        parts.append(f"### {r['path']}\n{r['content']}\n")
     return "\n".join(parts)
 
 
-def keywords(prompt: str) -> list[str]:
-    words = re.findall(r"[a-zA-Z][a-zA-Z0-9_-]+", prompt.lower())
-    return [w for w in words if len(w) >= MIN_KEYWORD_LEN and w not in STOPWORDS]
-
-
 def prompt_context(prompt: str) -> str:
-    kws = keywords(prompt)
-    if not kws:
+    if not prompt.strip():
         return ""
 
-    cypher = """
-    MATCH (m:Memory)
-    WITH m, [k IN $keywords WHERE
-        toLower(m.content) CONTAINS k OR toLower(m.path) CONTAINS k
-    ] AS hits
-    WHERE size(hits) > 0
-    RETURN m.path AS path, m.content AS content, size(hits) AS score
-    ORDER BY score DESC, m.path
-    LIMIT $limit
-    """
     with get_driver() as driver, driver.session() as s:
-        rows = list(s.run(cypher, keywords=kws, limit=MAX_PROMPT_HITS))
+        rows = _fulltext_search(s, prompt)
 
-    rows = [r for r in rows if not r["path"].startswith("profile/")]
+        if not rows:
+            terms = _extract_terms(prompt)
+            if terms:
+                lucene_query = " OR ".join(terms)
+                rows = _fulltext_search(s, lucene_query)
+
     if not rows:
         return ""
 
