@@ -135,5 +135,71 @@ def test_linked_list():
     print("All tests passed! Linked list structure verified.")
 
 
+def test_inject_memory():
+    driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+
+    # Ensure fulltext index exists
+    with driver.session() as session:
+        session.run("CREATE FULLTEXT INDEX memory_fulltext IF NOT EXISTS FOR (m:Memory) ON EACH [m.content, m.path]")
+
+    # Create test memories
+    with driver.session() as session:
+        session.run("MERGE (m:Memory {path: 'profile/identity.md'}) SET m.content = 'Name: TestUser'")
+        session.run("MERGE (m:Memory {path: 'project/auth-rewrite.md'}) SET m.content = 'Rewriting auth middleware for compliance'")
+        session.run("MERGE (m:Memory {path: 'feedback/testing.md'}) SET m.content = 'Always use real database in integration tests, never mock'")
+
+    # Wait for index to catch up
+    with driver.session() as session:
+        session.run("CALL db.index.fulltext.awaitEventuallyConsistentIndexRefresh()")
+
+    # --- SessionStart: should return profile memories ---
+    inject_script = os.path.join(os.path.dirname(__file__), "hooks", "inject_memory.py")
+    result = subprocess.run(
+        ["python3", inject_script, "--client", "claude_code"],
+        input=json.dumps({"hook_event_name": "SessionStart", "session_id": "test"}),
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, f"inject_memory failed: {result.stderr}"
+    output = json.loads(result.stdout)
+    ctx = output["hookSpecificOutput"]["additionalContext"]
+    assert "profile/identity.md" in ctx, f"Profile memory missing from session start: {ctx}"
+    assert "TestUser" in ctx
+
+    # --- UserPromptSubmit: fulltext search should find relevant memory ---
+    result = subprocess.run(
+        ["python3", inject_script, "--client", "claude_code"],
+        input=json.dumps({"hook_event_name": "UserPromptSubmit", "prompt": "how should we handle auth middleware"}),
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, f"inject_memory failed: {result.stderr}"
+    if result.stdout.strip():
+        output = json.loads(result.stdout)
+        ctx = output["hookSpecificOutput"]["additionalContext"]
+        assert "auth" in ctx.lower(), f"Auth memory not found via fulltext: {ctx}"
+
+    # --- UserPromptSubmit: search for testing should find feedback ---
+    result = subprocess.run(
+        ["python3", inject_script, "--client", "claude_code"],
+        input=json.dumps({"hook_event_name": "UserPromptSubmit", "prompt": "integration tests and mocking"}),
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, f"inject_memory failed: {result.stderr}"
+    if result.stdout.strip():
+        output = json.loads(result.stdout)
+        ctx = output["hookSpecificOutput"]["additionalContext"]
+        assert "mock" in ctx.lower() or "test" in ctx.lower(), f"Testing memory not found: {ctx}"
+
+    # Clean up
+    with driver.session() as session:
+        session.run("MATCH (m:Memory) WHERE m.path IN ['profile/identity.md', 'project/auth-rewrite.md', 'feedback/testing.md'] DETACH DELETE m")
+
+    driver.close()
+    print("All inject_memory tests passed!")
+
+
 if __name__ == "__main__":
     test_linked_list()
+    test_inject_memory()
