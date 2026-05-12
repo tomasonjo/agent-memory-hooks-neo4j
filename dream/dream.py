@@ -16,23 +16,34 @@ Usage:
     python dream.py --session <id>   # dream over one session
     python dream.py --since 24h      # only events newer than 24h / 7d / 30m
     python dream.py --dry-run        # print, don't write
+
+Authentication (tried in order):
+    1. ANTHROPIC_API_KEY env var — direct SDK call (original behaviour).
+    2. claude CLI (Claude Code / OAuth) — set DREAM_CLAUDE_BIN to override
+       the binary path; falls back to ``which claude`` automatically.
 """
 
 import argparse
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 from datetime import datetime, timezone, timedelta
 
-from anthropic import Anthropic
+try:
+    from anthropic import Anthropic as _Anthropic
+except ImportError:  # package not installed — CLI path will be used
+    _Anthropic = None  # type: ignore[assignment,misc]
+
 from neo4j import GraphDatabase
 
 NEO4J_URI = os.environ.get("HOOKS_NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.environ.get("HOOKS_NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.environ.get("HOOKS_NEO4J_PASSWORD", "password")
 
-MODEL = os.environ.get("DREAM_MODEL", "claude-opus-4-7")
+MODEL = os.environ.get("DREAM_MODEL", "claude-opus-4-5")
 MAX_TOKENS = 4096
 
 SYSTEM_PROMPT = """You are the "dream phase" for a Claude Code memory system. \
@@ -147,24 +158,76 @@ def render_existing(memories: list[dict]) -> str:
     return "\n\n".join(parts)
 
 
-def call_claude(client: Anthropic, transcript: str, existing: str) -> list[dict]:
-    user_msg = (
+def _build_user_msg(transcript: str, existing: str) -> str:
+    return (
         f"<existing_memories>\n{existing}\n</existing_memories>\n\n"
         f"<events>\n{transcript}\n</events>"
     )
+
+
+def _parse_memories(text: str) -> list[dict]:
+    text = text.strip()
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end == -1:
+        raise ValueError(f"no JSON in model output: {text[:200]}")
+    return json.loads(text[start : end + 1]).get("memories", [])
+
+
+def _call_claude_sdk(client, transcript: str, existing: str) -> list[dict]:
     msg = client.messages.create(
         model=MODEL,
         max_tokens=MAX_TOKENS,
         system=[
             {"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}
         ],
-        messages=[{"role": "user", "content": user_msg}],
+        messages=[{"role": "user", "content": _build_user_msg(transcript, existing)}],
     )
-    text = "".join(b.text for b in msg.content if b.type == "text").strip()
-    start, end = text.find("{"), text.rfind("}")
-    if start == -1 or end == -1:
-        raise ValueError(f"no JSON in model output: {text[:200]}")
-    return json.loads(text[start : end + 1]).get("memories", [])
+    text = "".join(b.text for b in msg.content if b.type == "text")
+    return _parse_memories(text)
+
+
+def _find_claude_cli() -> str:
+    """Return the claude CLI binary path or raise a clear error."""
+    explicit = os.environ.get("DREAM_CLAUDE_BIN")
+    if explicit:
+        return explicit
+    found = shutil.which("claude")
+    if found is None:
+        raise RuntimeError(
+            "Neither ANTHROPIC_API_KEY nor a claude CLI binary was found.\n"
+            "Install Claude Code (https://claude.ai/code) or set ANTHROPIC_API_KEY."
+        )
+    return found
+
+
+def _call_claude_cli(transcript: str, existing: str) -> list[dict]:
+    """Call Claude via the claude CLI (supports OAuth / Claude Code subscriptions)."""
+    claude_bin = _find_claude_cli()
+    result = subprocess.run(
+        [
+            claude_bin,
+            "-p",
+            "--tools", "",
+            "--model", MODEL,
+            "--system-prompt", SYSTEM_PROMPT,
+            "--no-session-persistence",
+            "--output-format", "text",
+            _build_user_msg(transcript, existing),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"claude CLI exited with code {result.returncode}:\n{result.stderr[:500]}"
+        )
+    return _parse_memories(result.stdout)
+
+
+def call_claude(client, transcript: str, existing: str) -> list[dict]:
+    if client is not None:
+        return _call_claude_sdk(client, transcript, existing)
+    return _call_claude_cli(transcript, existing)
 
 
 def write_memories(driver, session_id: str, memories: list[dict], watermark: str) -> int:
@@ -206,12 +269,14 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="print memories, don't write")
     args = ap.parse_args()
 
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        print("ANTHROPIC_API_KEY is not set", file=sys.stderr)
-        sys.exit(1)
+    # Prefer SDK (API key) when available; fall back to claude CLI (OAuth).
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    client = _Anthropic() if (api_key and _Anthropic is not None) else None
+    if client is None:
+        # Validate CLI is reachable before doing any DB work.
+        _find_claude_cli()
 
     since = parse_since(args.since) if args.since else None
-    client = Anthropic()
     driver = get_driver()
     try:
         sessions = fetch_events(driver, args.session, since)
