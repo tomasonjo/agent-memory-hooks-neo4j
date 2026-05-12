@@ -17,10 +17,11 @@ Usage:
     python dream.py --since 24h      # only events newer than 24h / 7d / 30m
     python dream.py --dry-run        # print, don't write
 
-Authentication (tried in order):
-    1. ANTHROPIC_API_KEY env var — direct SDK call (original behaviour).
-    2. claude CLI (Claude Code / OAuth) — set DREAM_CLAUDE_BIN to override
-       the binary path; falls back to ``which claude`` automatically.
+Authentication backend (--auth / DREAM_AUTH, default: sdk):
+    sdk  — Anthropic SDK; requires ANTHROPIC_API_KEY (original behaviour).
+    cli  — claude CLI in non-interactive mode (-p); uses the OAuth session
+           from an existing Claude Code installation.  Set DREAM_CLAUDE_BIN
+           to override the binary path resolved via PATH.
 """
 
 import argparse
@@ -262,19 +263,43 @@ def write_memories(driver, session_id: str, memories: list[dict], watermark: str
     return len(rows)
 
 
+def _resolve_auth(auth_arg: str) -> str:
+    """Return the effective auth backend ('sdk' or 'cli').
+
+    Resolution order: --auth flag > DREAM_AUTH env var > 'sdk' default.
+    """
+    backend = auth_arg or os.environ.get("DREAM_AUTH", "sdk")
+    if backend not in ("sdk", "cli"):
+        raise SystemExit(f"--auth / DREAM_AUTH must be 'sdk' or 'cli', got {backend!r}")
+    return backend
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--session", help="dream over a single session_id")
     ap.add_argument("--since", help="only include events newer than e.g. 24h, 7d, 30m")
     ap.add_argument("--dry-run", action="store_true", help="print memories, don't write")
+    ap.add_argument(
+        "--auth",
+        metavar="{sdk,cli}",
+        default="",
+        help=(
+            "auth backend: 'sdk' (ANTHROPIC_API_KEY, default) or "
+            "'cli' (claude CLI / OAuth). Overrides DREAM_AUTH env var."
+        ),
+    )
     args = ap.parse_args()
 
-    # Prefer SDK (API key) when available; fall back to claude CLI (OAuth).
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    client = _Anthropic() if (api_key and _Anthropic is not None) else None
-    if client is None:
-        # Validate CLI is reachable before doing any DB work.
-        _find_claude_cli()
+    backend = _resolve_auth(args.auth)
+    if backend == "sdk":
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            raise SystemExit("ANTHROPIC_API_KEY is not set (required for --auth sdk)")
+        if _Anthropic is None:
+            raise SystemExit("anthropic package is not installed (required for --auth sdk)")
+        client = _Anthropic()
+    else:
+        client = None
+        _find_claude_cli()  # validate early before any DB work
 
     since = parse_since(args.since) if args.since else None
     driver = get_driver()
