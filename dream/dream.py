@@ -202,7 +202,10 @@ def _find_claude_cli() -> str:
 
 
 def _call_claude_cli(transcript: str, existing: str) -> list[dict]:
-    """Call Claude via the claude CLI (supports OAuth / Claude Code subscriptions)."""
+    """Call Claude via the claude CLI (supports OAuth / Claude Code subscriptions).
+
+    The user message is fed via stdin to avoid ARG_MAX limits on large transcripts.
+    """
     claude_bin = _find_claude_cli()
     result = subprocess.run(
         [
@@ -213,8 +216,8 @@ def _call_claude_cli(transcript: str, existing: str) -> list[dict]:
             "--system-prompt", SYSTEM_PROMPT,
             "--no-session-persistence",
             "--output-format", "text",
-            _build_user_msg(transcript, existing),
         ],
+        input=_build_user_msg(transcript, existing),
         capture_output=True,
         text=True,
     )
