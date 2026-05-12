@@ -123,10 +123,16 @@ class TestCallClaudeCli:
         # user message must be piped via input=
         assert "transcript" in call_args.kwargs.get("input", "")
 
-    def test_non_zero_exit_raises(self, monkeypatch):
+    def test_non_zero_exit_raises_with_stderr(self, monkeypatch):
         monkeypatch.setenv("DREAM_CLAUDE_BIN", "/fake/claude")
         with patch("dream.subprocess.run", return_value=SimpleNamespace(returncode=1, stdout="", stderr="boom")):
-            with pytest.raises(RuntimeError, match="exited with code 1"):
+            with pytest.raises(RuntimeError, match="boom"):
+                dream_mod._call_claude_cli("t", "e")
+
+    def test_non_zero_exit_falls_back_to_stdout(self, monkeypatch):
+        monkeypatch.setenv("DREAM_CLAUDE_BIN", "/fake/claude")
+        with patch("dream.subprocess.run", return_value=SimpleNamespace(returncode=1, stdout="out-msg", stderr="")):
+            with pytest.raises(RuntimeError, match="out-msg"):
                 dream_mod._call_claude_cli("t", "e")
 
 
@@ -197,3 +203,132 @@ class TestMainEarlyExits:
                     with pytest.raises(RuntimeError, match="claude CLI binary was found"):
                         dream_mod.main()
                 mock_driver.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# --max-events / DREAM_MAX_EVENTS
+# ---------------------------------------------------------------------------
+def _make_main_mocks(monkeypatch, argv, sessions, *, auth="cli", claude_bin="/fake/claude"):
+    """Patch everything external so main() runs fully in memory."""
+    monkeypatch.setenv("DREAM_CLAUDE_BIN", claude_bin)
+
+    fake_driver = MagicMock()
+    fake_driver.__enter__ = lambda s: s
+    fake_driver.__exit__ = MagicMock(return_value=False)
+
+    with patch("sys.argv", argv), \
+         patch("dream.get_driver", return_value=fake_driver), \
+         patch("dream.fetch_events", return_value=sessions), \
+         patch("dream.fetch_existing_memories", return_value=[]), \
+         patch("dream.call_claude", return_value=[]) as mock_call, \
+         patch("dream.write_memories", return_value=0) as mock_write:
+        dream_mod.main()
+
+    return mock_call, mock_write
+
+
+class TestMaxEvents:
+    def _events(self, n):
+        return [{"timestamp": f"2026-01-01T00:00:0{i}.000Z", "event_name": "Stop"} for i in range(n)]
+
+    def test_session_under_limit_is_processed(self, monkeypatch, capsys):
+        sessions = [("ses-small", self._events(5))]
+        mock_call, mock_write = _make_main_mocks(
+            monkeypatch,
+            ["dream.py", "--auth", "cli", "--max-events", "10"],
+            sessions,
+        )
+        mock_call.assert_called_once()
+        mock_write.assert_called_once()
+
+    def test_session_over_limit_is_skipped(self, monkeypatch, capsys):
+        sessions = [("ses-big", self._events(50))]
+        mock_call, mock_write = _make_main_mocks(
+            monkeypatch,
+            ["dream.py", "--auth", "cli", "--max-events", "10"],
+            sessions,
+        )
+        mock_call.assert_not_called()
+        mock_write.assert_not_called()
+        assert "skipping" in capsys.readouterr().out
+
+    def test_skipped_session_watermark_not_updated(self, monkeypatch):
+        """Regression: oversized sessions must not advance last_dreamed_at."""
+        sessions = [("ses-big", self._events(50))]
+        _, mock_write = _make_main_mocks(
+            monkeypatch,
+            ["dream.py", "--auth", "cli", "--max-events", "10"],
+            sessions,
+        )
+        mock_write.assert_not_called()
+
+    def test_zero_means_no_limit(self, monkeypatch):
+        sessions = [("ses-huge", self._events(9999))]
+        mock_call, _ = _make_main_mocks(
+            monkeypatch,
+            ["dream.py", "--auth", "cli", "--max-events", "0"],
+            sessions,
+        )
+        mock_call.assert_called_once()
+
+    def test_env_var_respected(self, monkeypatch):
+        monkeypatch.setenv("DREAM_MAX_EVENTS", "10")
+        sessions = [("ses-big", self._events(50))]
+        mock_call, _ = _make_main_mocks(
+            monkeypatch,
+            ["dream.py", "--auth", "cli"],  # no --max-events flag
+            sessions,
+        )
+        mock_call.assert_not_called()
+
+    def test_flag_overrides_env_var(self, monkeypatch):
+        monkeypatch.setenv("DREAM_MAX_EVENTS", "10")
+        sessions = [("ses-big", self._events(50))]
+        mock_call, _ = _make_main_mocks(
+            monkeypatch,
+            ["dream.py", "--auth", "cli", "--max-events", "100"],
+            sessions,
+        )
+        mock_call.assert_called_once()
+
+    def test_mixed_sessions_only_large_skipped(self, monkeypatch, capsys):
+        sessions = [
+            ("ses-small", self._events(5)),
+            ("ses-big", self._events(50)),
+            ("ses-medium", self._events(8)),
+        ]
+        mock_call, mock_write = _make_main_mocks(
+            monkeypatch,
+            ["dream.py", "--auth", "cli", "--max-events", "10"],
+            sessions,
+        )
+        assert mock_call.call_count == 2   # small + medium
+        assert mock_write.call_count == 2
+        assert "skipping" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# Regression: error detail was silently dropped when stderr was empty
+# ---------------------------------------------------------------------------
+class TestErrorDetail:
+    def test_stderr_shown_in_error(self, monkeypatch):
+        monkeypatch.setenv("DREAM_CLAUDE_BIN", "/fake/claude")
+        result = SimpleNamespace(returncode=1, stdout="", stderr="context window exceeded")
+        with patch("dream.subprocess.run", return_value=result):
+            with pytest.raises(RuntimeError, match="context window exceeded"):
+                dream_mod._call_claude_cli("t", "e")
+
+    def test_stdout_shown_when_stderr_empty(self, monkeypatch):
+        """Regression: exit code 1 with empty stderr used to show no detail at all."""
+        monkeypatch.setenv("DREAM_CLAUDE_BIN", "/fake/claude")
+        result = SimpleNamespace(returncode=1, stdout="rate limit hit", stderr="")
+        with patch("dream.subprocess.run", return_value=result):
+            with pytest.raises(RuntimeError, match="rate limit hit"):
+                dream_mod._call_claude_cli("t", "e")
+
+    def test_fallback_message_when_both_empty(self, monkeypatch):
+        monkeypatch.setenv("DREAM_CLAUDE_BIN", "/fake/claude")
+        result = SimpleNamespace(returncode=1, stdout="", stderr="")
+        with patch("dream.subprocess.run", return_value=result):
+            with pytest.raises(RuntimeError, match="no output"):
+                dream_mod._call_claude_cli("t", "e")

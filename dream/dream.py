@@ -222,9 +222,8 @@ def _call_claude_cli(transcript: str, existing: str) -> list[dict]:
         text=True,
     )
     if result.returncode != 0:
-        raise RuntimeError(
-            f"claude CLI exited with code {result.returncode}:\n{result.stderr[:500]}"
-        )
+        detail = (result.stderr or result.stdout or "(no output)").strip()[:500]
+        raise RuntimeError(f"claude CLI exited with code {result.returncode}:\n{detail}")
     return _parse_memories(result.stdout)
 
 
@@ -291,6 +290,17 @@ def main():
             "'cli' (claude CLI / OAuth). Overrides DREAM_AUTH env var."
         ),
     )
+    ap.add_argument(
+        "--max-events",
+        type=int,
+        default=int(os.environ.get("DREAM_MAX_EVENTS", "0")),
+        metavar="N",
+        help=(
+            "skip sessions with more than N new events (avoids context-window "
+            "errors on very large sessions). 0 = no limit (default). "
+            "Also reads DREAM_MAX_EVENTS env var."
+        ),
+    )
     args = ap.parse_args()
 
     backend = _resolve_auth(args.auth)
@@ -313,6 +323,12 @@ def main():
             return
         existing = render_existing(fetch_existing_memories(driver))
         for session_id, events in sessions:
+            if args.max_events and len(events) > args.max_events:
+                print(
+                    f"\n=== skipping {session_id} ({len(events)} events > "
+                    f"--max-events {args.max_events}) ==="
+                )
+                continue
             print(f"\n=== dreaming over {session_id} ({len(events)} new events) ===")
             memories = call_claude(client, render_events(events), existing)
             for m in memories:
