@@ -392,3 +392,239 @@ class TestErrorDetail:
         with patch("dream.subprocess.run", return_value=result):
             with pytest.raises(RuntimeError, match="no output"):
                 dream_mod._call_claude_cli("t", "e")
+
+
+# ---------------------------------------------------------------------------
+# chunk_events
+# ---------------------------------------------------------------------------
+class TestChunkEvents:
+    def _events(self, n):
+        return [{"i": i} for i in range(n)]
+
+    def test_exact_multiple(self):
+        chunks = dream_mod.chunk_events(self._events(6), 3)
+        assert len(chunks) == 2
+        assert len(chunks[0]) == 3
+        assert len(chunks[1]) == 3
+
+    def test_remainder(self):
+        chunks = dream_mod.chunk_events(self._events(7), 3)
+        assert len(chunks) == 3
+        assert len(chunks[2]) == 1
+
+    def test_smaller_than_chunk(self):
+        chunks = dream_mod.chunk_events(self._events(2), 10)
+        assert len(chunks) == 1
+        assert len(chunks[0]) == 2
+
+    def test_preserves_order(self):
+        events = self._events(9)
+        chunks = dream_mod.chunk_events(events, 3)
+        reassembled = [e for c in chunks for e in c]
+        assert reassembled == events
+
+    def test_empty_events(self):
+        assert dream_mod.chunk_events([], 5) == []
+
+    def test_single_event(self):
+        chunks = dream_mod.chunk_events(self._events(1), 10)
+        assert chunks == [[{"i": 0}]]
+
+
+# ---------------------------------------------------------------------------
+# dream_chunked
+# ---------------------------------------------------------------------------
+class TestDreamChunked:
+    def _events(self, n):
+        return [{"timestamp": f"t{i}", "event_name": "Stop"} for i in range(n)]
+
+    def test_single_chunk_identical_to_call_claude(self):
+        """When events fit in one chunk the result must match a direct call_claude call."""
+        events = self._events(5)
+        expected = [{"path": "a.md", "content": "c"}]
+
+        with patch("dream.call_claude", return_value=expected) as mock:
+            result = dream_mod.dream_chunked(None, events, "existing", chunk_size=10)
+
+        assert result == expected
+        mock.assert_called_once()
+
+    def test_two_chunks_both_called(self):
+        events = self._events(6)
+        call_returns = [
+            [{"path": "a.md", "content": "v1"}],
+            [{"path": "b.md", "content": "v2"}],
+        ]
+
+        with patch("dream.call_claude", side_effect=call_returns) as mock:
+            result = dream_mod.dream_chunked(None, events, "existing", chunk_size=3)
+
+        assert mock.call_count == 2
+        paths = {m["path"] for m in result}
+        assert paths == {"a.md", "b.md"}
+
+    def test_first_chunk_uses_global_existing(self):
+        """Chunk 1 must receive the DB existing memories, not the accumulated ones."""
+        events = self._events(4)
+
+        captured_existing = []
+
+        def capture(client, transcript, existing):
+            captured_existing.append(existing)
+            return []
+
+        with patch("dream.call_claude", side_effect=capture):
+            dream_mod.dream_chunked(None, events, "GLOBAL_EXISTING", chunk_size=2)
+
+        assert captured_existing[0] == "GLOBAL_EXISTING"
+
+    def test_second_chunk_uses_accumulated_memories(self):
+        """Chunk 2 must receive the memories produced by chunk 1, not the global existing."""
+        events = self._events(4)
+        chunk1_memories = [{"path": "x.md", "content": "from-chunk-1"}]
+
+        call_returns = [chunk1_memories, []]
+        captured_existing = []
+
+        def capture(client, transcript, existing):
+            captured_existing.append(existing)
+            return call_returns.pop(0)
+
+        with patch("dream.call_claude", side_effect=capture):
+            dream_mod.dream_chunked(None, events, "GLOBAL", chunk_size=2)
+
+        # Second call's existing must mention the chunk-1 memory path
+        assert "x.md" in captured_existing[1]
+        assert "GLOBAL" not in captured_existing[1]
+
+    def test_later_chunk_overwrites_same_path(self):
+        """When two chunks emit the same memory path, the later chunk wins."""
+        events = self._events(6)
+        call_returns = [
+            [{"path": "p.md", "content": "old"}],
+            [{"path": "p.md", "content": "new"}],
+        ]
+
+        with patch("dream.call_claude", side_effect=call_returns):
+            result = dream_mod.dream_chunked(None, events, "", chunk_size=3)
+
+        assert len(result) == 1
+        assert result[0]["content"] == "new"
+
+    def test_memories_without_path_ignored(self):
+        events = self._events(3)
+        call_returns = [[{"content": "no-path"}, {"path": "ok.md", "content": "c"}]]
+
+        with patch("dream.call_claude", side_effect=call_returns):
+            result = dream_mod.dream_chunked(None, events, "", chunk_size=10)
+
+        assert result == [{"path": "ok.md", "content": "c"}]
+
+    def test_empty_chunks_produce_no_memories(self):
+        with patch("dream.call_claude", return_value=[]):
+            result = dream_mod.dream_chunked(None, self._events(4), "", chunk_size=2)
+        assert result == []
+
+
+# ---------------------------------------------------------------------------
+# --chunk-size / DREAM_CHUNK_SIZE wired into main
+# ---------------------------------------------------------------------------
+class TestChunkSizeMain:
+    def _events(self, n):
+        return [{"timestamp": f"2026-01-01T00:00:0{i}.000Z", "event_name": "Stop"} for i in range(n)]
+
+    def _run_main(self, monkeypatch, argv, sessions, chunked_return=None, call_return=None):
+        monkeypatch.setenv("DREAM_CLAUDE_BIN", "/fake/claude")
+        fake_driver = MagicMock()
+
+        with patch("sys.argv", argv), \
+             patch("dream.get_driver", return_value=fake_driver), \
+             patch("dream.fetch_events", return_value=sessions), \
+             patch("dream.fetch_existing_memories", return_value=[]), \
+             patch("dream.dream_chunked", return_value=chunked_return or []) as mock_chunked, \
+             patch("dream.call_claude", return_value=call_return or []) as mock_call, \
+             patch("dream.write_memories", return_value=0):
+            dream_mod.main()
+
+        return mock_chunked, mock_call
+
+    def test_small_session_uses_call_claude_not_chunked(self, monkeypatch):
+        sessions = [("ses-small", self._events(5))]
+        mock_chunked, mock_call = self._run_main(
+            monkeypatch,
+            ["dream.py", "--auth", "cli", "--chunk-size", "10"],
+            sessions,
+        )
+        mock_call.assert_called_once()
+        mock_chunked.assert_not_called()
+
+    def test_oversized_session_uses_dream_chunked(self, monkeypatch):
+        sessions = [("ses-big", self._events(20))]
+        mock_chunked, mock_call = self._run_main(
+            monkeypatch,
+            ["dream.py", "--auth", "cli", "--chunk-size", "10"],
+            sessions,
+        )
+        mock_chunked.assert_called_once()
+        mock_call.assert_not_called()
+
+    def test_chunk_size_env_var(self, monkeypatch):
+        monkeypatch.setenv("DREAM_CHUNK_SIZE", "10")
+        sessions = [("ses-big", self._events(20))]
+        mock_chunked, _ = self._run_main(
+            monkeypatch,
+            ["dream.py", "--auth", "cli"],
+            sessions,
+        )
+        mock_chunked.assert_called_once()
+
+    def test_chunk_size_zero_disables_chunking(self, monkeypatch):
+        """chunk-size=0 must leave --max-events as the only guard."""
+        sessions = [("ses-big", self._events(20))]
+        mock_chunked, mock_call = self._run_main(
+            monkeypatch,
+            ["dream.py", "--auth", "cli", "--chunk-size", "0", "--max-events", "5"],
+            sessions,
+        )
+        mock_chunked.assert_not_called()
+        mock_call.assert_not_called()  # skipped by max-events
+
+    def test_chunk_size_overrides_max_events_for_large_sessions(self, monkeypatch):
+        """When chunk-size is set a session larger than max-events is chunked, not skipped."""
+        sessions = [("ses-big", self._events(20))]
+        mock_chunked, _ = self._run_main(
+            monkeypatch,
+            ["dream.py", "--auth", "cli", "--chunk-size", "10", "--max-events", "5"],
+            sessions,
+        )
+        mock_chunked.assert_called_once()
+
+    def test_chunk_size_passed_correctly_to_dream_chunked(self, monkeypatch):
+        sessions = [("ses-big", self._events(20))]
+        monkeypatch.setenv("DREAM_CLAUDE_BIN", "/fake/claude")
+        monkeypatch.delenv("DREAM_CHUNK_SIZE", raising=False)
+        fake_driver = MagicMock()
+
+        with patch("sys.argv", ["dream.py", "--auth", "cli", "--chunk-size", "7"]), \
+             patch("dream.get_driver", return_value=fake_driver), \
+             patch("dream.fetch_events", return_value=sessions), \
+             patch("dream.fetch_existing_memories", return_value=[]), \
+             patch("dream.dream_chunked", return_value=[]) as mock_chunked, \
+             patch("dream.write_memories", return_value=0):
+            dream_mod.main()
+
+        _, kwargs = mock_chunked.call_args
+        assert kwargs.get("chunk_size") == 7 or mock_chunked.call_args[0][3] == 7
+
+    # Regression: sessions previously forced-skipped by --max-events are now
+    # processed when --chunk-size is also provided.
+    def test_regression_skipped_session_now_chunked(self, monkeypatch, capsys):
+        sessions = [("ses-was-skipped", self._events(50))]
+        mock_chunked, mock_call = self._run_main(
+            monkeypatch,
+            ["dream.py", "--auth", "cli", "--max-events", "10", "--chunk-size", "10"],
+            sessions,
+        )
+        mock_chunked.assert_called_once()
+        out = capsys.readouterr().out
+        assert "skipping" not in out

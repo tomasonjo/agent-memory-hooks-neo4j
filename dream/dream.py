@@ -22,6 +22,15 @@ Authentication backend (--auth / DREAM_AUTH, default: sdk):
     cli  — claude CLI in non-interactive mode (-p); uses the OAuth session
            from an existing Claude Code installation.  Set DREAM_CLAUDE_BIN
            to override the binary path resolved via PATH.
+
+Chunked processing (--chunk-size / DREAM_CHUNK_SIZE, default: 0 = off):
+    Split oversized sessions into overlapping windows of N events so they
+    fit within the model context window.  Each chunk receives the memories
+    accumulated by all previous chunks as its "existing memories" context,
+    letting Claude merge and refine rather than duplicate.  When chunking
+    is enabled, --max-events is only applied AFTER chunking fails (i.e. a
+    chunk itself is too large); without chunking, --max-events still causes
+    the whole session to be skipped.
 """
 
 import argparse
@@ -233,6 +242,48 @@ def call_claude(client, transcript: str, existing: str) -> list[dict]:
     return _call_claude_cli(transcript, existing)
 
 
+def chunk_events(events: list[dict], chunk_size: int) -> list[list[dict]]:
+    """Split *events* into consecutive windows of at most *chunk_size* items."""
+    return [events[i : i + chunk_size] for i in range(0, len(events), chunk_size)]
+
+
+def dream_chunked(
+    client,
+    events: list[dict],
+    global_existing: str,
+    chunk_size: int,
+) -> list[dict]:
+    """Process a session that exceeds the context window by splitting it into
+    sequential chunks of *chunk_size* events.
+
+    Memory accumulation strategy:
+    - Chunk 1 receives the global DB memories as context (same as a normal run).
+    - Each subsequent chunk receives the memories produced so far by earlier
+      chunks.  This lets Claude refine and merge across the full session rather
+      than producing independent, potentially duplicate memories per chunk.
+    - When two chunks produce a memory at the same path the later chunk wins,
+      so the final pass always reflects the most recent evidence.
+    """
+    chunks = chunk_events(events, chunk_size)
+    accumulated: dict[str, dict] = {}  # path → memory, updated after each chunk
+
+    for idx, chunk in enumerate(chunks):
+        chunk_num = f"{idx + 1}/{len(chunks)}"
+        print(f"  [chunk {chunk_num}] {len(chunk)} events", flush=True)
+
+        existing = (
+            global_existing
+            if not accumulated
+            else render_existing(list(accumulated.values()))
+        )
+        new_memories = call_claude(client, render_events(chunk), existing)
+        for m in new_memories:
+            if m.get("path") and m.get("content"):
+                accumulated[m["path"]] = m
+
+    return list(accumulated.values())
+
+
 def write_memories(driver, session_id: str, memories: list[dict], watermark: str) -> int:
     """Upsert memories and advance the session's last_dreamed_at watermark.
 
@@ -298,7 +349,20 @@ def main():
         help=(
             "skip sessions with more than N new events (avoids context-window "
             "errors on very large sessions). 0 = no limit (default). "
+            "Ignored for sessions processed via --chunk-size. "
             "Also reads DREAM_MAX_EVENTS env var."
+        ),
+    )
+    ap.add_argument(
+        "--chunk-size",
+        type=int,
+        default=int(os.environ.get("DREAM_CHUNK_SIZE", "0")),
+        metavar="N",
+        help=(
+            "split sessions larger than N events into sequential N-event chunks "
+            "instead of skipping them. Each chunk receives the memories produced "
+            "by previous chunks as context. 0 = disabled (default). "
+            "Also reads DREAM_CHUNK_SIZE env var."
         ),
     )
     args = ap.parse_args()
@@ -323,15 +387,27 @@ def main():
             return
         existing = render_existing(fetch_existing_memories(driver))
         for session_id, events in sessions:
-            if args.max_events and len(events) > args.max_events:
+            n = len(events)
+            use_chunks = args.chunk_size and n > args.chunk_size
+            if not use_chunks and args.max_events and n > args.max_events:
                 print(
-                    f"\n=== skipping {session_id} ({len(events)} events > "
+                    f"\n=== skipping {session_id} ({n} events > "
                     f"--max-events {args.max_events}) ==="
                 )
                 continue
-            print(f"\n=== dreaming over {session_id} ({len(events)} new events) ===")
+            if use_chunks:
+                n_chunks = -(-n // args.chunk_size)  # ceiling division
+                print(
+                    f"\n=== dreaming over {session_id} "
+                    f"({n} events in {n_chunks} chunks of {args.chunk_size}) ==="
+                )
+            else:
+                print(f"\n=== dreaming over {session_id} ({n} new events) ===")
             try:
-                memories = call_claude(client, render_events(events), existing)
+                if use_chunks:
+                    memories = dream_chunked(client, events, existing, args.chunk_size)
+                else:
+                    memories = call_claude(client, render_events(events), existing)
             except Exception as exc:
                 print(f"  ERROR: {exc} — skipping session", file=sys.stderr)
                 continue
