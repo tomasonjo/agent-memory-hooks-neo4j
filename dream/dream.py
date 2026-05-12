@@ -330,7 +330,11 @@ def main():
                 )
                 continue
             print(f"\n=== dreaming over {session_id} ({len(events)} new events) ===")
-            memories = call_claude(client, render_events(events), existing)
+            try:
+                memories = call_claude(client, render_events(events), existing)
+            except Exception as exc:
+                print(f"  ERROR: {exc} — skipping session", file=sys.stderr)
+                continue
             for m in memories:
                 print(f"\n--- {m.get('path')} ---")
                 print(m.get("content", ""))

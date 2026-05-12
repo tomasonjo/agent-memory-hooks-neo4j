@@ -308,6 +308,66 @@ class TestMaxEvents:
 
 
 # ---------------------------------------------------------------------------
+# Per-session error recovery: a failing session must not abort the whole run
+# ---------------------------------------------------------------------------
+class TestPerSessionErrorRecovery:
+    def _events(self, n):
+        return [{"timestamp": f"2026-01-01T00:00:0{i}.000Z", "event_name": "Stop"} for i in range(n)]
+
+    def test_error_on_one_session_continues_to_next(self, monkeypatch, capsys):
+        """Regression: RuntimeError from call_claude previously crashed the whole run."""
+        sessions = [
+            ("ses-a", self._events(5)),
+            ("ses-b", self._events(5)),  # this one will raise
+            ("ses-c", self._events(5)),
+        ]
+        call_count = 0
+
+        def flaky_call_claude(client, transcript, existing):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                raise RuntimeError("Prompt is too long")
+            return []
+
+        monkeypatch.setenv("DREAM_CLAUDE_BIN", "/fake/claude")
+        fake_driver = MagicMock()
+
+        with patch("sys.argv", ["dream.py", "--auth", "cli"]), \
+             patch("dream.get_driver", return_value=fake_driver), \
+             patch("dream.fetch_events", return_value=sessions), \
+             patch("dream.fetch_existing_memories", return_value=[]), \
+             patch("dream.call_claude", side_effect=flaky_call_claude), \
+             patch("dream.write_memories", return_value=0) as mock_write:
+            dream_mod.main()
+
+        # ses-a and ses-c must still be written; ses-b skipped
+        assert mock_write.call_count == 2
+        written_ids = [c.args[1] for c in mock_write.call_args_list]  # args: driver, session_id, ...
+        assert "ses-a" in written_ids
+        assert "ses-c" in written_ids
+        assert "ses-b" not in written_ids
+        assert "ERROR" in capsys.readouterr().err
+
+    def test_error_does_not_advance_watermark(self, monkeypatch):
+        """Watermark for a failed session must not be updated."""
+        sessions = [("ses-fail", self._events(5))]
+
+        monkeypatch.setenv("DREAM_CLAUDE_BIN", "/fake/claude")
+        fake_driver = MagicMock()
+
+        with patch("sys.argv", ["dream.py", "--auth", "cli"]), \
+             patch("dream.get_driver", return_value=fake_driver), \
+             patch("dream.fetch_events", return_value=sessions), \
+             patch("dream.fetch_existing_memories", return_value=[]), \
+             patch("dream.call_claude", side_effect=RuntimeError("too long")), \
+             patch("dream.write_memories") as mock_write:
+            dream_mod.main()
+
+        mock_write.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # Regression: error detail was silently dropped when stderr was empty
 # ---------------------------------------------------------------------------
 class TestErrorDetail:
